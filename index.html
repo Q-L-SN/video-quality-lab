@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>摄像头帧率/分辨率模拟器</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:16px;line-height:1.45}
+    .row{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+    .panel{border:1px solid #ddd;border-radius:8px;padding:12px}
+    video{display:none} /* 仅用作源，不直接展示 */
+    canvas{max-width:100%;height:auto;border:1px solid #eee;border-radius:4px;image-rendering:auto}
+    .ctrl{display:flex;flex-direction:column;gap:10px;min-width:270px}
+    label{font-weight:600}
+    input[type="range"]{width:240px}
+    code{background:#f6f6f6;padding:2px 6px;border-radius:4px}
+    .kv{display:grid;grid-template-columns:auto 1fr;gap:6px 12px;align-items:center}
+    button{padding:8px 12px;border-radius:6px;border:1px solid #ccc;background:#fafafa;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
+    .warn{color:#b1440e}
+  </style>
+</head>
+<body>
+  <h2>摄像头实时画面 · 帧率/分辨率模拟</h2>
+
+  <div class="row">
+    <div class="panel">
+      <canvas id="out"></canvas>
+    </div>
+
+    <div class="panel ctrl">
+      <div>
+        <button id="start">启动摄像头</button>
+        <button id="stop" disabled>停止</button>
+      </div>
+
+      <div>
+        <label for="fps">目标帧率</label>
+        <div>
+          <input type="range" id="fps" min="1" max="40" step="1" value="10" />
+          <span><b id="fpsVal">10</b> fps</span>
+        </div>
+      </div>
+
+      <div>
+        <label for="resSel">目标分辨率</label>
+        <div>
+          <select id="resSel">
+            <option value="256x144">144p (256×144)</option>
+            <option value="426x240">240p (426×240)</option>
+            <option value="640x360" selected>360p (640×360)</option>
+            <option value="854x480">480p (854×480)</option>
+            <option value="1280x720">720p (1280×720)</option>
+            <option value="1920x1080">1080p (1920×1080)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="kv mono">
+        <div>实际渲染 FPS</div><div><span id="fpsNow">0</span></div>
+        <div>相机设置</div><div id="camSettings">—</div>
+        <div>输出尺寸</div><div id="outSize">—</div>
+        <div>提示</div><div class="warn">首次使用需授权相机；Safari 需安全上下文</div>
+      </div>
+    </div>
+  </div>
+
+  <video id="src" playsinline webkit-playsinline muted></video>
+
+<script>
+(async () => {
+  const startBtn = document.getElementById('start');
+  const stopBtn  = document.getElementById('stop');
+  const fpsRange = document.getElementById('fps');
+  const fpsVal   = document.getElementById('fpsVal');
+  const resSel   = document.getElementById('resSel');
+
+  const video = document.getElementById('src');
+  const canvas = document.getElementById('out');
+  const ctx = canvas.getContext('2d');
+
+  const fpsNowEl = document.getElementById('fpsNow');
+  const camSettingsEl = document.getElementById('camSettings');
+  const outSizeEl = document.getElementById('outSize');
+
+  let stream = null;
+  let running = false;
+  let targetFps = parseInt(fpsRange.value, 10);
+  let drawCount = 0;
+  let rafId = null;
+  let lastDrawTs = 0;
+
+  function parseWH(v) { const [w,h] = v.split('x').map(n=>parseInt(n,10)); return {w,h}; }
+
+  function updateLabels() {
+    fpsVal.textContent = targetFps;
+    const {w,h} = parseWH(resSel.value);
+    outSizeEl.textContent = `${w}×${h}`;
+  }
+
+  async function startCamera() {
+    if (running) return;
+    try {
+      // 初始请求不强求分辨率/帧率，以提升成功率；后续用 applyConstraints 调整
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment" }, audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+      running = true;
+      stopBtn.disabled = false;
+      startBtn.disabled = true;
+      updateLabels();
+      // 尝试施加目标约束（Safari 可能只部分支持）
+      await applyDesiredConstraints();
+      // 启动渲染循环（软件抽帧为兜底）
+      drawLoop(performance.now());
+      // 定时统计渲染 FPS
+      setInterval(() => {
+        fpsNowEl.textContent = drawCount.toFixed(0);
+        drawCount = 0;
+        // 展示相机当前 settings
+        const track = stream?.getVideoTracks?.()[0];
+        if (track) {
+          const s = track.getSettings?.() || {};
+          camSettingsEl.textContent =
+            `${s.width||'—'}×${s.height||'—'} @ ${s.frameRate? (Math.round(s.frameRate*10)/10):'—'}fps`;
+        }
+      }, 1000);
+    } catch (err) {
+      console.error(err);
+      alert('启动失败：' + (err && err.message ? err.message : err));
+      stopCamera();
+    }
+  }
+
+  function stopCamera() {
+    running = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    if (stream) {
+      stream.getTracks().forEach(t => t.stop());
+      stream = null;
+    }
+    video.srcObject = null;
+    fpsNowEl.textContent = '0';
+    camSettingsEl.textContent = '—';
+  }
+
+  async function applyDesiredConstraints() {
+    if (!stream) return;
+    const {w,h} = parseWH(resSel.value);
+    const track = stream.getVideoTracks()[0];
+    if (!track) return;
+    const constraints = {
+      width: { ideal: w },
+      height: { ideal: h },
+      frameRate: { ideal: targetFps, max: targetFps }
+      // resizeMode 可选: "crop-and-scale"（Safari 可能不支持）
+    };
+    try {
+      await track.applyConstraints(constraints);
+    } catch (e) {
+      // 约束失败时忽略，改由软件抽帧/缩放
+      console.warn('applyConstraints 失败，使用软件模拟:', e);
+    }
+  }
+
+  function drawOnce() {
+    const {w,h} = parseWH(resSel.value);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+    }
+    // 将 video 画面缩放到目标分辨率
+    ctx.drawImage(video, 0, 0, w, h);
+    drawCount++;
+  }
+
+  function drawLoop(now) {
+    if (!running) return;
+    const interval = 1000 / targetFps;
+    if (!lastDrawTs || now - lastDrawTs >= interval) {
+      drawOnce();
+      lastDrawTs = now;
+    }
+    rafId = requestAnimationFrame(drawLoop);
+  }
+
+  // 事件
+  startBtn.addEventListener('click', startCamera);
+  stopBtn.addEventListener('click', stopCamera);
+
+  fpsRange.addEventListener('input', async () => {
+    targetFps = parseInt(fpsRange.value, 10);
+    updateLabels();
+    // 试图让相机侧也降帧
+    await applyDesiredConstraints();
+  });
+
+  resSel.addEventListener('change', async () => {
+    updateLabels();
+    await applyDesiredConstraints();
+  });
+
+  // 功能检测
+  if (!('mediaDevices' in navigator) || !('getUserMedia' in navigator.mediaDevices)) {
+    document.querySelector('.warn').textContent =
+      '当前环境不支持 getUserMedia（需要支持的浏览器和安全上下文）。';
+    startBtn.disabled = true;
+  }
+})();
+</script>
+</body>
+</html>
